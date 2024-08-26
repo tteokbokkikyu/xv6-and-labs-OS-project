@@ -1,0 +1,359 @@
+diff --git a/Makefile b/Makefile
+index c926b7e..23fe79c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -193,6 +193,11 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sleep\
++	$U/_primes\
++	$U/_find\
++	$U/_trace\
++	$U/_sysinfotest\
+ 
+ 
+ 
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..b3322b6 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -80,3 +80,17 @@ kalloc(void)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++// 获取剩余内存字节数，调用时*dest传入info.freemem的引用
++void
++freebytes(uint64 *dest) {
++  *dest = 0;
++  // 遍历指针并计数
++  struct run *p = kmem.freelist;
++  acquire(&kmem.lock);
++  while(p) {
++    // 给调入的info.freemem增加一个PGSIZE
++    *dest += PGSIZE;
++    p = p->next;
++  }
++  release(&kmem.lock);
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..4a77ece 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -300,6 +300,8 @@ fork(void)
+     if(p->ofile[i])
+       np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
++  
++  np->trace_mask = p->trace_mask;
+ 
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
+@@ -654,3 +656,14 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++// 获取进程数，和获取内存类似，传入info.nproc的引用，然后链表动一次就加一次
++void
++procnum(uint64 *dest) {
++  *dest = 0;
++  struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if(p->state != UNUSED) 
++      (*dest)++;
++  }
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..d6ba73b 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -105,4 +105,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int trace_mask;		//add a mask for trace
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..7978b7b 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -8,25 +8,23 @@
+ #include "defs.h"
+ 
+ // Fetch the uint64 at addr from the current process.
+-int
+-fetchaddr(uint64 addr, uint64 *ip)
++int fetchaddr(uint64 addr, uint64 *ip)
+ {
+   struct proc *p = myproc();
+-  if(addr >= p->sz || addr+sizeof(uint64) > p->sz)
++  if (addr >= p->sz || addr + sizeof(uint64) > p->sz)
+     return -1;
+-  if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
++  if (copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
+     return -1;
+   return 0;
+ }
+ 
+ // Fetch the nul-terminated string at addr from the current process.
+ // Returns length of string, not including nul, or -1 for error.
+-int
+-fetchstr(uint64 addr, char *buf, int max)
++int fetchstr(uint64 addr, char *buf, int max)
+ {
+   struct proc *p = myproc();
+   int err = copyinstr(p->pagetable, buf, addr, max);
+-  if(err < 0)
++  if (err < 0)
+     return err;
+   return strlen(buf);
+ }
+@@ -35,7 +33,8 @@ static uint64
+ argraw(int n)
+ {
+   struct proc *p = myproc();
+-  switch (n) {
++  switch (n)
++  {
+   case 0:
+     return p->trapframe->a0;
+   case 1:
+@@ -54,8 +53,7 @@ argraw(int n)
+ }
+ 
+ // Fetch the nth 32-bit system call argument.
+-int
+-argint(int n, int *ip)
++int argint(int n, int *ip)
+ {
+   *ip = argraw(n);
+   return 0;
+@@ -64,8 +62,7 @@ argint(int n, int *ip)
+ // Retrieve an argument as a pointer.
+ // Doesn't check for legality, since
+ // copyin/copyout will do that.
+-int
+-argaddr(int n, uint64 *ip)
++int argaddr(int n, uint64 *ip)
+ {
+   *ip = argraw(n);
+   return 0;
+@@ -74,11 +71,10 @@ argaddr(int n, uint64 *ip)
+ // Fetch the nth word-sized system call argument as a null-terminated string.
+ // Copies into buf, at most max.
+ // Returns string length if OK (including nul), -1 if error.
+-int
+-argstr(int n, char *buf, int max)
++int argstr(int n, char *buf, int max)
+ {
+   uint64 addr;
+-  if(argaddr(n, &addr) < 0)
++  if (argaddr(n, &addr) < 0)
+     return -1;
+   return fetchstr(addr, buf, max);
+ }
+@@ -104,43 +100,79 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_sysinfo(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+-[SYS_fork]    sys_fork,
+-[SYS_exit]    sys_exit,
+-[SYS_wait]    sys_wait,
+-[SYS_pipe]    sys_pipe,
+-[SYS_read]    sys_read,
+-[SYS_kill]    sys_kill,
+-[SYS_exec]    sys_exec,
+-[SYS_fstat]   sys_fstat,
+-[SYS_chdir]   sys_chdir,
+-[SYS_dup]     sys_dup,
+-[SYS_getpid]  sys_getpid,
+-[SYS_sbrk]    sys_sbrk,
+-[SYS_sleep]   sys_sleep,
+-[SYS_uptime]  sys_uptime,
+-[SYS_open]    sys_open,
+-[SYS_write]   sys_write,
+-[SYS_mknod]   sys_mknod,
+-[SYS_unlink]  sys_unlink,
+-[SYS_link]    sys_link,
+-[SYS_mkdir]   sys_mkdir,
+-[SYS_close]   sys_close,
++    [SYS_fork] sys_fork,
++    [SYS_exit] sys_exit,
++    [SYS_wait] sys_wait,
++    [SYS_pipe] sys_pipe,
++    [SYS_read] sys_read,
++    [SYS_kill] sys_kill,
++    [SYS_exec] sys_exec,
++    [SYS_fstat] sys_fstat,
++    [SYS_chdir] sys_chdir,
++    [SYS_dup] sys_dup,
++    [SYS_getpid] sys_getpid,
++    [SYS_sbrk] sys_sbrk,
++    [SYS_sleep] sys_sleep,
++    [SYS_uptime] sys_uptime,
++    [SYS_open] sys_open,
++    [SYS_write] sys_write,
++    [SYS_mknod] sys_mknod,
++    [SYS_unlink] sys_unlink,
++    [SYS_link] sys_link,
++    [SYS_mkdir] sys_mkdir,
++    [SYS_close] sys_close,
++    [SYS_trace] sys_trace,
++    [SYS_sysinfo] sys_sysinfo,
+ };
+ 
+-void
+-syscall(void)
++const char *syscall_names[] = {
++  [SYS_fork] "fork",
++  [SYS_exit] "exit",
++  [SYS_wait] "wait",
++  [SYS_pipe] "pipe",
++  [SYS_read] "read",
++  [SYS_kill] "kill",
++  [SYS_exec] "exec",
++  [SYS_fstat] "fstat",
++  [SYS_chdir] "chdir",
++  [SYS_dup] "dup",
++  [SYS_getpid] "getpid",
++  [SYS_sbrk] "sbrk",
++  [SYS_sleep] "sleep",
++  [SYS_uptime] "uptime",
++  [SYS_open] "open",
++  [SYS_write] "write",
++  [SYS_mknod] "mknod",
++  [SYS_unlink] "unlink",
++  [SYS_link] "link",
++  [SYS_mkdir] "mkdir",
++  [SYS_close] "close",
++  [SYS_trace] "trace",
++  [SYS_sysinfo] "sysinfo",
++};
++void syscall(void)
+ {
+   int num;
+   struct proc *p = myproc();
+ 
+   num = p->trapframe->a7;
+-  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++  if (num > 0 && num < NELEM(syscalls) && syscalls[num])
++  {
+     p->trapframe->a0 = syscalls[num]();
+-  } else {
++    // 相当于共享了proc.h里的trace_mask
++    int trace_mask = p->trace_mask;
++    if((trace_mask >> num) & 1) {
++      printf("%d: syscall %s -> %d\n", p->pid, syscall_names[num], p->trapframe->a0);
++    }
++  }
++  else
++  {
+     printf("%d %s: unknown sys call %d\n",
+-            p->pid, p->name, num);
++           p->pid, p->name, num);
+     p->trapframe->a0 = -1;
+   }
+ }
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..0dfedc7 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22
++#define SYS_sysinfo 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..055ec81 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,11 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "sysinfo.h"
++
++// 函数声明
++void freebytes(uint64 *);
++void procnum(uint64 *);
+ 
+ uint64
+ sys_exit(void)
+@@ -95,3 +100,36 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// 添加sys_trace函数
++uint64
++sys_trace(void)
++{
++  int mask;
++  // argint检索第n个系统调用函数
++  if(argint(0,&mask) < 0)
++    return -1;
++  struct proc *p = myproc();
++  p->trace_mask = mask;
++  return 0;
++}
++
++// 添加sys_sysinfo函数
++uint64
++sys_sysinfo(void)
++{
++  // 暂存系统信息
++  struct sysinfo info;
++  // 给info赋值
++  freebytes(&(info.freemem));
++  procnum(&(info.nproc));
++
++  // 获取虚拟地址
++  uint64 destaddr;
++  argaddr(0,&destaddr);
++
++  //从kernel拷贝到user
++  if(copyout(myproc()->pagetable, destaddr, (char*)&info, sizeof info) < 0)
++    return -1;
++  return 0;
++}
+diff --git a/user/user.h b/user/user.h
+index b71ecda..7fb1e80 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,6 @@
+ struct stat;
+ struct rtcdate;
+-
++struct sysinfo;
+ // system calls
+ int fork(void);
+ int exit(int) __attribute__((noreturn));
+@@ -23,6 +23,10 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++// 在此处添加trace
++int trace(int);
++// 在此处添加info
++int sysinfo(struct sysinfo *);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..fd676a0 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,7 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++# 添加trace
++entry("trace");
++# 添加sysinfo
++entry("sysinfo");
