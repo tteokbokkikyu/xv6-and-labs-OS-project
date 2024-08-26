@@ -135,6 +135,23 @@ printfinit(void)
 void
 backtrace(void) 
 {
+	
 	 uint64 fp = r_fp();  // 获取当前帧指针
-	 
+	 uint64 start = PGROUNDDOWN(fp);  // 当前栈页的底部地址
+     uint64 end = PGROUNDUP(fp);  // 当前栈页的顶部地址
+    
+
+    printf("backtrace:\n");
+
+    // 循环遍历调用栈
+    while (fp < end && fp >= start) {
+        // 获取返回地址
+        uint64 ra = *(uint64 *)(fp - 8);
+        
+        // 打印返回地址
+        printf("%p\n", ra);
+        
+        // 获取前一个栈帧的帧指针
+        fp = *(uint64 *)(fp - 16);
+    }
 }
